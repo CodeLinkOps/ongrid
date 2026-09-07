@@ -454,3 +454,63 @@ func TestListChannelsRequiresAuth(t *testing.T) {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
+
+// TestResolveIncidentAcceptsEmptyBody 覆盖最常见的用法：关闭一条告警、
+// 不留备注。
+//
+// mutationReq 只有一个可选的 note，所以空 body 本就是合法请求。原先
+// json.Decode 在空 body 上返回 io.EOF，被当成参数错误报出去：
+//
+//   {"error":"invalid argument\nEOF","code":"invalid-argument"}
+//
+// 那个错误既没说哪个参数不对，也没说要传什么 —— 而正确答案是「加一对
+// 空花括号」。curl 不带 -d 是最自然的写法，于是这个接口对着最常见的
+// 用法报一个看不懂的错。
+func TestResolveIncidentAcceptsEmptyBody(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	f := &fakeService{
+		resolveIncidentResp: &svc.Incident{
+			ID: 12, RuleKey: "scrape_down", RuleName: "Scrape Down",
+			Severity: "warning", Status: "resolved", Summary: "up == 0",
+			FiredAt: now, UpdatedAt: now,
+		},
+	}
+	h := NewHandler(f, f, f)
+	router := buildRouter(h, &tenantctx.Tenant{UserID: 99, Role: "user"})
+
+	// 完全没有 body —— 等价于 curl -X POST 不带 -d
+	req := httptest.NewRequest(http.MethodPost, "/v1/alerts/incidents/12/resolve", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("空 body 应该被接受，得到 status=%d body=%s", w.Code, w.Body.String())
+	}
+	if f.lastIncidentID != 12 {
+		t.Fatalf("incident id = %d，期望 12", f.lastIncidentID)
+	}
+	if f.lastIncidentNote != "" {
+		t.Fatalf("note = %q，空 body 时应该是空字符串", f.lastIncidentNote)
+	}
+}
+
+// TestResolveIncidentRejectsMalformedBody 守住另一边：**坏 JSON 仍然要报错**。
+// 上面那个修复只放行 io.EOF，不是把解析错误一律吞掉。
+func TestResolveIncidentRejectsMalformedBody(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeService{}
+	h := NewHandler(f, f, f)
+	router := buildRouter(h, &tenantctx.Tenant{UserID: 99, Role: "user"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/alerts/incidents/12/resolve",
+		strings.NewReader(`{"note": `))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code == http.StatusOK {
+		t.Fatalf("坏 JSON 不该被接受，得到 status=%d", w.Code)
+	}
+}
