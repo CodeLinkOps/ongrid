@@ -240,12 +240,24 @@ func (c *Client) callForm(ctx context.Context, method, token string, form url.Va
 // chat.update). channel accepts a public channel id (C…), private group
 // (G…), DM (D…), or a user id for DMs.
 func (c *Client) PostMessage(ctx context.Context, channel, text string) (string, error) {
+	return c.PostMessageInThread(ctx, channel, "", text)
+}
+
+// PostMessageInThread posts into a thread when threadTS is non-empty.
+//
+// Replying inside a thread is not cosmetic — it is what keeps one
+// conversation's context separate from the next one's. See the session
+// key in stream.go.
+func (c *Client) PostMessageInThread(ctx context.Context, channel, threadTS, text string) (string, error) {
 	var resp struct {
 		apiResp
 		Channel string `json:"channel"`
 		TS      string `json:"ts"`
 	}
 	body := nativeMessageBody(channel, text)
+	if threadTS != "" {
+		body["thread_ts"] = threadTS
+	}
 	if err := c.call(ctx, "chat.postMessage", c.botToken, body, &resp); err != nil {
 		return "", err
 	}
