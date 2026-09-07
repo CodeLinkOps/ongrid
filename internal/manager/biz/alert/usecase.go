@@ -1076,7 +1076,17 @@ func allowedScopesForKind(kind string) []string {
 	case model.RuleKindLogSearch:
 		return []string{model.RuleScopeGlobal, model.RuleScopeHost}
 	case model.RuleKindMetricRaw:
-		return []string{model.RuleScopeGlobal, model.RuleScopeHost}
+		// monitoring_pipeline 必须在列：内置的 scrape_down 就是用它种下的
+		// （seed_rules.go 的 seedScrapeDownRule），而抑制逻辑依赖这个 scope
+		// 来判断「prom_ingest_fail 时压掉所有 scrape_down」（inhibit.go）。
+		//
+		// 不在列的后果是**内置规则改不了自己**：任何 PUT 都会走
+		// buildRuleRow，被自己的校验以
+		//   scope_type "monitoring_pipeline" not allowed for kind "metric_raw"
+		// 拒绝。这个 bug 是潜伏的 —— 停用走的是
+		// POST /alert-rules/{id}/enabled，那条路不经过 buildRuleRow，
+		// 所以只有真去编辑它时才暴露。
+		return []string{model.RuleScopeGlobal, model.RuleScopeHost, model.RuleScopeMonitoringPipeline}
 	case model.RuleKindMetricAnomaly, model.RuleKindMetricForecast,
 		model.RuleKindLogMatch, model.RuleKindLogVolume:
 		return []string{model.RuleScopeHost, model.RuleScopeGlobal}
