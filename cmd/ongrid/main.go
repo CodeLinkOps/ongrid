@@ -434,6 +434,9 @@ func main() {
 	// outcome). Registered once here so package-globals in internal/pkg/prom
 	// are non-nil before any evaluator tick or promwrite Push runs.
 	prom.RegisterManagerMetrics(reg, log.With(slog.String("comp", "prom-manager-metrics")))
+	// 通知卡片的字段名语言。必须在任何 Sender 开始发消息之前设置 ——
+	// 运行期再改不会崩，但会让同一批告警一部分中文一部分英文。
+	notify.SetDefaultLocale(firstNonEmpty(os.Getenv("ONGRID_DEFAULT_LOCALE"), "en"))
 	notifyRouter := notify.NewFromConfig(cfg.Notification, log.With(slog.String("comp", "notify")))
 
 	// system_settings BC: admin-editable runtime config (LLM creds today,
