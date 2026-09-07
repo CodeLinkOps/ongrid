@@ -3,6 +3,7 @@ package anthropicoauth
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -276,5 +277,99 @@ func TestPostSurfacesObjectShapedError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "cannot unmarshal") {
 		t.Fatalf("仍然是解码失败 —— 那句话对真实原因只字未提: %v", err)
+	}
+}
+
+// TestTransportRetriesOnceOn401 覆盖「token 看起来没过期，但服务端拒绝」。
+//
+// 只按过期时间刷新是不够的：另一个客户端登录会把 token 轮换掉，而本地那份
+// 的 expires_at 还没到。没有这条重试的话，AI 会一直坏到本地过期为止 ——
+// 可能是大半个小时，而唯一的症状是一个看起来像配置错误的 401。
+func TestTransportRetriesOnceOn401(t *testing.T) {
+	var mu sync.Mutex
+	var issued int32
+	srv := tokenServer(t, &issued, &mu)
+	defer srv.Close()
+	withTokenURL(t, srv.URL)
+
+	store := &memStore{cred: Credential{
+		AccessToken:  "stale-but-unexpired",
+		RefreshToken: "r",
+		ExpiresAt:    time.Now().Add(time.Hour), // 本地看还很新鲜
+	}}
+
+	var calls int
+	var seen []string
+	tr := &Transport{
+		Store:      store,
+		HTTPClient: srv.Client(),
+		Base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			seen = append(seen, r.Header.Get("Authorization"))
+			if calls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Body:       io.NopCloser(strings.NewReader(`{"error":"unauthorized"}`)),
+					Header:     make(http.Header),
+					Request:    r,
+				}, nil
+			}
+			return okResp(r), nil
+		}),
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/chat/completions", nil)
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("底层请求了 %d 次，期望 2（原始 + 重试一次）", calls)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("重试后 status = %d", resp.StatusCode)
+	}
+	if seen[0] == seen[1] {
+		t.Fatal("重试用的还是同一个 token —— 401 之后必须强制刷新")
+	}
+	if store.saves != 1 {
+		t.Fatalf("Save 调用了 %d 次，期望 1", store.saves)
+	}
+}
+
+// TestTransportDoesNotLoopOn401：刷新之后仍然 401 时不能无限重试。
+func TestTransportDoesNotLoopOn401(t *testing.T) {
+	var mu sync.Mutex
+	var issued int32
+	srv := tokenServer(t, &issued, &mu)
+	defer srv.Close()
+	withTokenURL(t, srv.URL)
+
+	store := &memStore{cred: Credential{
+		AccessToken: "a", RefreshToken: "r", ExpiresAt: time.Now().Add(time.Hour)}}
+	var calls int
+	tr := &Transport{
+		Store:      store,
+		HTTPClient: srv.Client(),
+		Base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader("{}")),
+				Header:     make(http.Header),
+				Request:    r,
+			}, nil
+		}),
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/x", nil)
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+	if calls != 2 {
+		t.Fatalf("请求了 %d 次，期望恰好 2 —— 不能无限重试", calls)
 	}
 }
