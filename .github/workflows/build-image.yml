@@ -1,0 +1,94 @@
+# 把我们 fork 的 ongrid 构建成镜像推到 GHCR。
+#
+# **为什么需要它**：fork 里的修改如果不构建成镜像，就一行都跑不到线上 ——
+# 生产现在拉的是上游的 docker.cnb.cool/ongridio/ongrid。没有这条流水线，
+# fork 只是一份「看起来改好了」的代码。
+#
+# ## tag 方案：<上游版本>-cl.<短 sha>
+#
+# 例：v0.15.1-cl.2c9bd06
+#
+# 一眼能看出两件事：基于哪个上游版本、含我们哪个提交。排查线上问题时
+# 「跑的是哪份代码」不需要猜。
+#
+# **不用 latest，不重推同名 tag**（CodeLinkOps 规范）。重推会让
+# 「集群里跑的是哪份代码」查不出来，而且 rollout 不触发 —— 新 pod 是新版、
+# 老 pod 是旧版，两者共存且没有任何提示。
+#
+# ## 只构建 amd64
+#
+# 我们所有机器都是 x86_64。加 arm64 会让每次构建时间翻倍，而收益是 0。
+# 真要用到 arm 机器时再加，那时是有依据的决定。
+name: build-image
+
+on:
+  push:
+    branches: [main]
+    # 只有影响镜像内容的改动才重建。改 README 不该占用十几分钟构建。
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'skills/**'
+      - 'agents/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'VERSION'
+      - 'deploy/Dockerfile.ongrid'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ongrid:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 计算 tag
+        id: meta
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          sha="$(git rev-parse --short HEAD)"
+          tag="${version}-cl.${sha}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/codelinkops/ongrid:${tag}" >> "$GITHUB_OUTPUT"
+          echo "构建 ghcr.io/codelinkops/ongrid:${tag}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.ongrid
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.tag }}
+          # GitHub Actions 缓存：Go 依赖和 onnxruntime 下载很重，
+          # 不加缓存每次都要十几分钟。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出部署提示
+        run: |
+          echo "### 镜像已推送" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "部署：改 /opt/ongrid/.env 的 ONGRID_IMAGE 后 docker compose up -d ongrid" >> "$GITHUB_STEP_SUMMARY"
