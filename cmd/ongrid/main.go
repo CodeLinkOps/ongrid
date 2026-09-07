@@ -2879,6 +2879,7 @@ func main() {
 			DefaultChannels: cfg.Notification.DefaultChannels,
 			Cooldown:        cfg.Alert.Cooldown,
 			Interval:        cfg.Alert.EvaluatorInterval,
+			GaugeInterval:   cfg.Alert.GaugeRefreshInterval,
 			EdgeLister:      edgeUC,
 			PromQuerier:     alertPromQuerier,
 			LogQuerier:      lokiLogClient,

@@ -247,6 +247,20 @@ type AlertConfig struct {
 	// bounded by Alert.Cooldown so stretching this doesn't multiply
 	// notifications — only the storage + evaluator-CPU side.
 	EvaluatorInterval time.Duration
+	// GaugeRefreshInterval is how often the evaluator recomputes the
+	// device_last_seen_seconds_ago gauge. Kept separate from
+	// EvaluatorInterval on purpose.
+	//
+	// EvaluatorInterval was stretched to 5m to stop long-firing rules
+	// from racking up alert_events. That reasoning does not apply to the
+	// gauge: refreshing it is one edge List plus a few gauge Sets, and it
+	// writes no events. Sharing the 5m tick made the gauge up to 5
+	// minutes stale, which silently defeats the built-in offline rule —
+	// `device_last_seen_seconds_ago > 90` cannot mean 90s when its input
+	// only moves every 300s.
+	//
+	// env: ONGRID_ALERT_GAUGE_INTERVAL; default 30s.
+	GaugeRefreshInterval time.Duration
 	// EdgeOfflineThreshold is the heartbeat staleness above which an edge
 	// counts as offline.
 	// env: ONGRID_ALERT_EDGE_OFFLINE_THRESHOLD; default 90s.
@@ -592,6 +606,7 @@ func Load() (*Config, error) {
 	c.Alert.DiskUsedPercent = getEnvFloat("ONGRID_ALERT_DISK_USED_PERCENT", 90)
 	c.Alert.Load1 = getEnvFloat("ONGRID_ALERT_LOAD1", 0)
 	c.Alert.EvaluatorInterval = getEnvDuration("ONGRID_ALERT_EVAL_INTERVAL", 5*time.Minute)
+	c.Alert.GaugeRefreshInterval = getEnvDuration("ONGRID_ALERT_GAUGE_INTERVAL", 30*time.Second)
 	c.Alert.EdgeOfflineThreshold = getEnvDuration("ONGRID_ALERT_EDGE_OFFLINE_THRESHOLD", 90*time.Second)
 	c.Alert.PromIngestFailLimit = getEnvInt("ONGRID_ALERT_PROM_INGEST_FAIL_LIMIT", 5)
 

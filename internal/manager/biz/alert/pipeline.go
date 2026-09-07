@@ -75,6 +75,12 @@ type PipelineEvaluatorOpts struct {
 	DefaultChannels []string
 	Cooldown        time.Duration
 	Interval        time.Duration
+	// GaugeInterval is how often refreshDeviceStalenessGauge runs. It is
+	// deliberately decoupled from Interval: the gauge is an input to the
+	// built-in offline rule (`device_last_seen_seconds_ago > 90`), so its
+	// resolution bounds how fast that rule can possibly detect anything.
+	// Zero means 30s.
+	GaugeInterval time.Duration
 
 	EdgeLister  EdgeLister
 	PromQuerier PromQuerier
@@ -109,8 +115,9 @@ type PipelineEvaluator struct {
 	resolver  ChannelResolver
 	inhibitor Inhibitor
 	channels  []string
-	cooldown  time.Duration
-	interval  time.Duration
+	cooldown      time.Duration
+	interval      time.Duration
+	gaugeInterval time.Duration
 
 	edges          EdgeLister
 	prom           PromQuerier
@@ -146,6 +153,9 @@ func NewPipelineEvaluator(opts PipelineEvaluatorOpts) *PipelineEvaluator {
 	if opts.Cooldown <= 0 {
 		opts.Cooldown = 10 * time.Minute
 	}
+	if opts.GaugeInterval <= 0 {
+		opts.GaugeInterval = 30 * time.Second
+	}
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
@@ -161,6 +171,7 @@ func NewPipelineEvaluator(opts PipelineEvaluatorOpts) *PipelineEvaluator {
 		channels:       append([]string(nil), opts.DefaultChannels...),
 		cooldown:       opts.Cooldown,
 		interval:       opts.Interval,
+		gaugeInterval:  opts.GaugeInterval,
 		edges:          opts.EdgeLister,
 		prom:           opts.PromQuerier,
 		logq:           opts.LogQuerier,
@@ -172,12 +183,35 @@ func NewPipelineEvaluator(opts PipelineEvaluatorOpts) *PipelineEvaluator {
 }
 
 // Loop runs the evaluator until ctx is cancelled.
+//
+// Two tickers, on purpose:
+//
+//   - interval (default 5m) drives rule evaluation, which writes
+//     alert_events. That is what the 2026-05-31 slowdown was about.
+//   - gaugeInterval (default 30s) drives only
+//     refreshDeviceStalenessGauge: one edge List plus a few gauge Sets,
+//     no events written.
+//
+// Sharing one ticker made device_last_seen_seconds_ago up to 5 minutes
+// stale, which silently defeats the built-in offline rule — a `> 90`
+// threshold cannot mean 90 seconds when its input only moves every 300.
+// The symptom is nasty because nothing errors: the gauge simply reports
+// the same value on every scrape while the device is already gone.
 func (e *PipelineEvaluator) Loop(ctx context.Context) error {
 	if e.uc == nil || e.rules == nil {
 		return nil
 	}
 	tick := time.NewTicker(e.interval)
 	defer tick.Stop()
+	// Only run the gauge ticker when it is actually faster than the
+	// evaluator; otherwise evaluate() already covers it and a second
+	// ticker would just duplicate the List query.
+	var gaugeC <-chan time.Time
+	if e.edges != nil && e.gaugeInterval > 0 && e.gaugeInterval < e.interval {
+		gt := time.NewTicker(e.gaugeInterval)
+		defer gt.Stop()
+		gaugeC = gt.C
+	}
 	e.evaluate(ctx)
 	for {
 		select {
@@ -185,6 +219,8 @@ func (e *PipelineEvaluator) Loop(ctx context.Context) error {
 			return nil
 		case <-tick.C:
 			e.evaluate(ctx)
+		case <-gaugeC:
+			e.refreshDeviceStalenessGauge(ctx, e.now())
 		}
 	}
 }
@@ -235,9 +271,14 @@ func (e *PipelineEvaluator) evaluate(ctx context.Context) {
 // inventory are deleted so the metric_raw evaluator doesn't keep firing
 // on a removed device.
 //
-// Called every evaluator tick (30s default). Errors here are logged and
-// skipped — gauge staleness for one tick is preferable to a panic in
-// the alert loop.
+// Called on its own ticker (ONGRID_ALERT_GAUGE_INTERVAL, default 30s)
+// and once at the top of every evaluator tick. It is deliberately NOT
+// tied to ONGRID_ALERT_EVAL_INTERVAL (default 5m): this gauge is the
+// input to `device_last_seen_seconds_ago > 90`, so its refresh rate is
+// a hard floor on how fast that rule can detect anything.
+//
+// Errors here are logged and skipped — gauge staleness for one tick is
+// preferable to a panic in the alert loop.
 func (e *PipelineEvaluator) refreshDeviceStalenessGauge(ctx context.Context, now time.Time) {
 	edges, err := e.edges.List(ctx, edgebiz.ListFilter{Limit: 1000})
 	if err != nil {

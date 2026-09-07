@@ -8,9 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	edgebiz "github.com/ongridio/ongrid/internal/manager/biz/edge"
 	model "github.com/ongridio/ongrid/internal/manager/model/alert"
 	edgemodel "github.com/ongridio/ongrid/internal/manager/model/edge"
+	"github.com/ongridio/ongrid/internal/pkg/prom"
 	"github.com/ongridio/ongrid/internal/pkg/promquery"
 )
 
@@ -331,4 +335,74 @@ func vectorUp(samples map[string]string) *promquery.InstantResult {
 	}
 	raw, _ := json.Marshal(entries)
 	return &promquery.InstantResult{ResultType: "vector", Result: raw}
+}
+
+// TestPipelineGaugeRefreshesBetweenEvaluatorTicks pins the fix for the
+// bug where device_last_seen_seconds_ago went stale for a whole
+// evaluator interval.
+//
+// Before: refreshDeviceStalenessGauge only ran inside evaluate(), so
+// with the shipped defaults (eval 5m, offline threshold 90s) the gauge
+// reported the same value for up to 300s after a device stopped
+// heartbeating. Nothing errored — the series simply stopped moving —
+// so `device_last_seen_seconds_ago > 90` could not mean what its name
+// says.
+//
+// After: Loop drives the gauge on its own faster ticker. This test
+// advances wall-clock time and refreshes the gauge WITHOUT running an
+// evaluator tick, which is exactly what the old code could not do.
+func TestPipelineGaugeRefreshesBetweenEvaluatorTicks(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	prom.RegisterManagerMetrics(reg, nil)
+
+	repo := newFakeRepo()
+	lastSeen := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	edges := &fakeEdgeLister{edges: []*edgemodel.Edge{
+		{ID: 7, Name: "edge-7", LastSeenAt: &lastSeen},
+	}}
+
+	now := lastSeen
+	ev := newPipelineEvaluator(t, repo, &fakeNotifier{}, NewStaticRulesProvider(), PipelineEvaluatorOpts{
+		EdgeLister:    edges,
+		Interval:      5 * time.Minute,
+		GaugeInterval: 30 * time.Second,
+		Now:           func() time.Time { return now },
+	})
+
+	if ev.gaugeInterval >= ev.interval {
+		t.Fatalf("gauge interval %v must stay below evaluator interval %v — otherwise "+
+			"the offline rule inherits the evaluator's resolution", ev.gaugeInterval, ev.interval)
+	}
+
+	// Two refreshes 120s apart with NO evaluate() in between. 120s is
+	// chosen so the second reading crosses the 90s offline threshold
+	// while still being far below the 5m evaluator tick — i.e. exactly
+	// the window the old code could not observe.
+	ev.refreshDeviceStalenessGauge(context.Background(), now)
+	first := testutil.ToFloat64(prom.DeviceLastSeenSecondsAgo.WithLabelValues("7", "edge-7"))
+
+	now = now.Add(120 * time.Second)
+	ev.refreshDeviceStalenessGauge(context.Background(), now)
+	second := testutil.ToFloat64(prom.DeviceLastSeenSecondsAgo.WithLabelValues("7", "edge-7"))
+
+	if delta := second - first; delta < 119 || delta > 121 {
+		t.Fatalf("gauge advanced by %vs between evaluator ticks, want ~120s "+
+			"(first=%v second=%v)", delta, first, second)
+	}
+	if second <= 90 {
+		t.Fatalf("120s after a 12:00 heartbeat the gauge must exceed the 90s offline "+
+			"threshold, got %v — this is the whole point of the separate ticker", second)
+	}
+}
+
+// TestPipelineGaugeIntervalDefaults documents the zero-value behaviour:
+// callers that do not set GaugeInterval still get a sub-minute refresh
+// rather than silently inheriting the 5m evaluator tick.
+func TestPipelineGaugeIntervalDefaults(t *testing.T) {
+	ev := newPipelineEvaluator(t, newFakeRepo(), &fakeNotifier{}, NewStaticRulesProvider(), PipelineEvaluatorOpts{
+		Interval: 5 * time.Minute,
+	})
+	if ev.gaugeInterval != 30*time.Second {
+		t.Fatalf("default gaugeInterval = %v, want 30s", ev.gaugeInterval)
+	}
 }
