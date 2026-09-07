@@ -59,6 +59,12 @@ type StreamClient struct {
 	client  *Client
 	allowed map[string]struct{} // Slack user_id allowlist (parsed from app.AllowFrom)
 	log     *slog.Logger
+
+	// selfID is our own bot user id, resolved once at connect via
+	// auth.test. Used to drop the bot's own @-mention from inbound text
+	// — see stripMentions. Empty when auth.test failed; the code then
+	// degrades to the old behaviour rather than refusing to run.
+	selfID string
 }
 
 // NewStreamClient builds a stream client for one Slack ImApp. The sender
@@ -96,6 +102,16 @@ func (c *StreamClient) ProviderName() string { return "slack" }
 // + return nil so the supervisor reconnects immediately (no backoff sleep
 // for a planned reconnect).
 func (c *StreamClient) Run(ctx context.Context) error {
+	// Resolve our own user id once per connection so inbound text can
+	// drop the bot's own @-mention. Failure is not fatal: without it we
+	// fall back to the previous behaviour, which is noisier but works.
+	if id, err := c.client.AuthTest(ctx); err != nil {
+		c.log.Warn("slack auth.test failed — bot self-mention will not be stripped",
+			slog.Any("err", err))
+	} else {
+		c.selfID = id
+		c.log.Info("slack socket mode: resolved bot user id", slog.String("bot_user_id", id))
+	}
 	wsURL, err := c.client.OpenConnection(ctx)
 	if err != nil {
 		return fmt.Errorf("apps.connections.open: %w", err)
@@ -239,9 +255,32 @@ func (c *StreamClient) handleEvent(payload json.RawMessage) {
 		ThreadID:      ev.ThreadTS,
 		OpenID:        ev.User,
 		UserName:      ev.User, // Slack only ships user_id here; the bridge logs it
-		Text:          stripMentions(ev.Text),
+		Text:          stripMentions(ev.Text, c.selfID),
 		EventID:       ev.TS,
 		ReceiveIDType: "channel",
+	}
+	// Replying inside a thread is the natural way to ask about an alert
+	// card — and the one case where the agent starts blind, because a
+	// thread gets its own (empty) session. Fetch the root message so the
+	// bridge can seed that session with it.
+	//
+	// ev.ThreadTS == ev.TS means "this message started the thread", so
+	// there is no parent to fetch.
+	if ev.ThreadTS != "" && ev.ThreadTS != ev.TS {
+		parent, err := c.client.ThreadParent(context.Background(), ev.Channel, ev.ThreadTS)
+		switch {
+		case err == nil:
+			in.ThreadParentText = parent
+		case strings.Contains(err.Error(), "missing_scope"):
+			// Not fatal — the reply still works, just less informed.
+			// Name the scope so the operator can act on it instead of
+			// wondering why the bot keeps asking what they mean.
+			c.log.Warn("slack: cannot read thread root — add channels:history (public) "+
+				"or groups:history (private) to the app's bot scopes",
+				slog.Any("err", err))
+		default:
+			c.log.Warn("slack: fetch thread root failed", slog.Any("err", err))
+		}
 	}
 	sender := senderAdapter{client: c.client, channel: ev.Channel}
 	// Detach: agent runs take 30s+; the read loop must keep moving
@@ -257,7 +296,37 @@ func (c *StreamClient) handleEvent(payload json.RawMessage) {
 // the agent prompt can read. We keep the user-id letters so the model
 // sees a stable reference; full display-name resolution would need a
 // users.info round-trip per message which we skip for the MVP.
-func stripMentions(s string) string {
+//
+// **selfID is removed outright, not rewritten.** In a channel every
+// message addressed to the bot starts with `<@U…>` naming the bot —
+// that is addressing, not content. Rewriting it to `@U0BV8744CSF`
+// leaves the model staring at an identifier it cannot resolve, and it
+// answers with "what does U0BV8744CSF refer to?" instead of doing the
+// work. Observed in production 2026-09-07.
+func stripMentions(s string, selfID string) string {
+	if selfID != "" {
+		// Slack sometimes appends a display hint: <@U123|name>.
+		for _, form := range []string{"<@" + selfID + ">", "<@" + selfID + "|"} {
+			for {
+				i := strings.Index(s, form)
+				if i < 0 {
+					break
+				}
+				end := i + len(form)
+				if strings.HasSuffix(form, "|") {
+					if j := strings.Index(s[end:], ">"); j >= 0 {
+						end += j + 1
+					}
+				}
+				s = s[:i] + s[end:]
+			}
+		}
+		s = strings.TrimSpace(s)
+	}
+	return stripOtherMentions(s)
+}
+
+func stripOtherMentions(s string) string {
 	// <@UABCD> → @UABCD ; <#C1234|general> → #general ; <https://x|x> → x
 	// Minimal sweep — we treat anything between < and > with a |.
 	out := strings.Builder{}

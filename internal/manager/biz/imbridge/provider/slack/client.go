@@ -110,6 +110,23 @@ func NewClientFromSecret(rawSecret string) (*Client, error) {
 // code uses the default.
 func (c *Client) SetBaseURL(u string) { c.base = strings.TrimRight(u, "/") }
 
+// AuthTest returns the bot's own Slack user id.
+//
+// Needed so inbound text can drop the bot's own @-mention: in a channel
+// every message addressed to us starts with `<@U…>`, and that markup is
+// **addressing, not content**. Left in, the model spends its turn asking
+// what `U0BV8744CSF` refers to instead of answering the question — seen
+// in production 2026-09-07.
+func (c *Client) AuthTest(ctx context.Context) (userID string, err error) {
+	var out struct {
+		UserID string `json:"user_id"`
+	}
+	if err := c.call(ctx, "auth.test", c.botToken, struct{}{}, &out); err != nil {
+		return "", err
+	}
+	return out.UserID, nil
+}
+
 // Probe validates both tokens required by Socket Mode without sending a message.
 func (c *Client) Probe(ctx context.Context) error {
 	if err := c.call(ctx, "auth.test", c.botToken, struct{}{}, nil); err != nil {
@@ -258,3 +275,44 @@ const (
 	// either DNS / network or the operator's proxy is wedged.
 	DialTimeout = 10 * time.Second
 )
+
+// ThreadParent returns the text of the message a thread hangs off.
+//
+// # Why the bot needs this
+//
+// Operators reply **inside the thread under an alert card** and ask
+// "这是啥情况". That is the natural thing to do, and it is also the one
+// case where the bot has no idea what is being discussed: a Slack
+// thread maps to its own Ongrid session, which starts empty. Observed
+// in production 2026-09-07 — the bot answered a question about an
+// alert it could not see.
+//
+// # Scope
+//
+// Needs `channels:history` (public) or `groups:history` (private). An
+// app installed before this feature will not have them, and Slack
+// answers `missing_scope`. Callers should treat that as "no context
+// available" rather than an error — the reply still works, it is just
+// less informed — and surface the scope name once so the operator can
+// fix it.
+func (c *Client) ThreadParent(ctx context.Context, channel, threadTS string) (string, error) {
+	var out struct {
+		Messages []struct {
+			Text string `json:"text"`
+			TS   string `json:"ts"`
+		} `json:"messages"`
+	}
+	body := map[string]any{
+		"channel": channel,
+		"ts":      threadTS,
+		"limit":   1,
+		"inclusive": true,
+	}
+	if err := c.call(ctx, "conversations.replies", c.botToken, body, &out); err != nil {
+		return "", err
+	}
+	if len(out.Messages) == 0 {
+		return "", nil
+	}
+	return out.Messages[0].Text, nil
+}
