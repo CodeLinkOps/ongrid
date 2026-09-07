@@ -1,9 +1,16 @@
 name: Release
 
+# --- CodeLinkOps fork：已停用 ---
+#
+# 上游这条把镜像推到 docker.cnb.cool，用的是我们没有的凭据 ——
+# 一旦打 v*.*.* 的 tag 就必然失败。而失败的 CI 放着不管，最后的结果是
+# 大家习惯性忽略红灯，真正该看的那条也一起被忽略。
+#
+# 我们自己的镜像走 .github/workflows/build-image.yml（推 GHCR）。
+#
+# **只改触发条件、不删文件**：将来同步上游时冲突只有这一处。
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
 
 permissions:
   contents: write

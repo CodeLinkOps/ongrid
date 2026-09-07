@@ -1,8 +1,15 @@
 name: PR Checklist
 
+# --- CodeLinkOps fork：已停用 ---
+#
+# 这条检查的是上游的贡献条款勾选框。对内部 PR 没有意义，留着只会在每个
+# PR 上挂一个永远过不了的必需检查。
+#
+# **要往上游提 PR 时，从上游仓库的 PR 界面走**，那边这条仍然生效。
+#
+# 只改触发条件、不删文件：将来同步上游时冲突只有这一处。
 on:
-  pull_request:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
 
 permissions:
   contents: read
