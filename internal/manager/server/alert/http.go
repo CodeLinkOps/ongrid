@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -533,8 +534,19 @@ func (h *Handler) mutateIncident(w http.ResponseWriter, r *http.Request, action 
 		writeErr(w, err)
 		return
 	}
+	// mutationReq 只有一个可选的 note，所以**空 body 是合法请求** ——
+	// 「关闭这条告警，不留备注」。
+	//
+	// json.Decode 在空 body 上返回 io.EOF，原先当成参数错误报出去，
+	// 客户端看到的是：
+	//
+	//   {"error":"invalid argument\nEOF","code":"invalid-argument"}
+	//
+	// 那个错误既没说哪个参数不对，也没说要传什么 —— 实际排查时会去翻
+	// 请求体、翻字段名，而正确答案是「加一对空花括号」。curl 不带 -d
+	// 是最自然的写法，于是这个接口对着最常见的用法报一个看不懂的错。
 	var req mutationReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, errors.Join(errs.ErrInvalid, err))
 		return
 	}
