@@ -23,6 +23,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/ongridio/ongrid/internal/pkg/llm/anthropicoauth"
 	"github.com/ongridio/ongrid/internal/pkg/zhipuauth"
 )
 
@@ -219,12 +220,40 @@ func NewWithResolver(cfg Config, resolver Resolver, budget BudgetChecker, reg *p
 	}
 }
 
+// WithAnthropicOAuth attaches a subscription-credential store to a client
+// built by New / NewWithResolver.
+//
+// Separate from the constructor on purpose: the secret usecase this store
+// needs is wired much later in main.go than the LLM client, and threading
+// it through every constructor call site would touch a lot of code for a
+// feature that is off by default.
+//
+// A nil store, or a client that fell back to noop, is a no-op.
+func WithAnthropicOAuth(c Client, store anthropicoauth.Store) Client {
+	oc, ok := c.(*openaiClient)
+	if !ok || store == nil {
+		return c
+	}
+	oc.oauth = store
+	// Drop any SDK clients built before the store existed — they carry an
+	// HTTPClient without the OAuth transport, and the cache key
+	// (apiKey, baseURL) would happily hand one back forever.
+	oc.sdkMu.Lock()
+	oc.sdkCache = nil
+	oc.sdkMu.Unlock()
+	return c
+}
+
 type openaiClient struct {
 	cfg      Config
 	resolver Resolver
 	budget   BudgetChecker
 	metrics  *metrics
 	log      *slog.Logger
+
+	// oauth, when non-nil, supplies Anthropic subscription credentials.
+	// Left nil the client behaves exactly as before — API keys only.
+	oauth anthropicoauth.Store
 
 	// SDK clients are keyed by (apiKey, baseURL) so a settings change
 	// transparently swaps the underlying *openai.Client without us having
@@ -323,6 +352,28 @@ func (c *openaiClient) sdkFor(apiKey, baseURL string) *openai.Client {
 			Transport: &zhipuJWTTransport{apiKey: apiKey, base: http.DefaultTransport},
 		}
 	}
+	// Anthropic via OAuth (subscription login) instead of an API key.
+	//
+	// Same shape as the Zhipu case above: the SDK's static apiKey stops
+	// mattering because the transport rewrites Authorization on every
+	// request — here with an access token it refreshes on expiry.
+	//
+	// Anthropic's OpenAI-compatible endpoint accepts the OAuth bearer in
+	// exactly the header the SDK already sends, **including tool
+	// calling** (verified against the live API 2026-09-07), so nothing
+	// downstream of this line has to know which credential type is in
+	// play.
+	//
+	// Gated on the store being wired AND a credential existing, so an
+	// install that uses a plain API key is completely unaffected.
+	if c.oauth != nil && looksLikeAnthropicURL(baseURL) {
+		if cred, err := c.oauth.Load(context.Background()); err == nil && (cred.AccessToken != "" || cred.Refreshable()) {
+			sdkCfg.HTTPClient = &http.Client{
+				Timeout:   90 * time.Second,
+				Transport: &anthropicoauth.Transport{Store: c.oauth, Base: http.DefaultTransport},
+			}
+		}
+	}
 	sdk := openai.NewClientWithConfig(sdkCfg)
 	c.sdkCache[k] = sdk
 	return sdk
@@ -361,6 +412,18 @@ func normalizeOpenAIBaseURL(raw string) string {
 		return u.String()
 	}
 	return s
+}
+
+// looksLikeAnthropicURL reports whether baseURL points at Anthropic.
+// Deliberately host-based rather than an exact match so a proxy in front
+// of api.anthropic.com still gets the OAuth transport.
+func looksLikeAnthropicURL(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return h == "api.anthropic.com" || strings.HasSuffix(h, ".anthropic.com")
 }
 
 // zhipuJWTTransport rewrites the Authorization header on every outbound

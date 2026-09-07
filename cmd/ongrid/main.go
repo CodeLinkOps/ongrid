@@ -49,6 +49,7 @@ import (
 	"github.com/ongridio/ongrid/internal/pkg/errs"
 	"github.com/ongridio/ongrid/internal/pkg/httpserver"
 	"github.com/ongridio/ongrid/internal/pkg/llm"
+	"github.com/ongridio/ongrid/internal/pkg/llm/anthropicoauth"
 	"github.com/ongridio/ongrid/internal/pkg/logger"
 	"github.com/ongridio/ongrid/internal/pkg/runner"
 	"github.com/ongridio/ongrid/internal/pkg/secretbox"
@@ -536,6 +537,8 @@ func main() {
 	lokiResolver := managerbizsetting.NewLokiResolver(settingSvc, cfg.Logs.URL)
 	tempoResolver := managerbizsetting.NewTempoResolver(settingSvc, cfg.Traces.URL)
 	settingHandler := managerserversetting.NewHandler(settingSvc, managerbizsetting.NewObservabilityApplierFromEnv(settingSvc, log))
+	// OAuth 登录接口在下面 Register 之后挂上（见 registerAnthropicOAuth 调用），
+	// 因为它需要 secretUC，而那个在本行之后才构造。
 
 	// Grafana integration biz layer (PR-2). Wraps the pkg/grafana HTTP
 	// client and reads creds from system_settings on every Test/Sync call.
@@ -599,6 +602,10 @@ func main() {
 		nil, // BudgetChecker wired in Phase 2
 		reg,
 	)
+	// Anthropic 订阅登录（OAuth）。存在凭据时，打 api.anthropic.com 的请求
+	// 改用自动刷新的 bearer；没登录就完全不影响原来的 API key 路径。
+	anthropicOAuthStore := anthropicoauth.SecretStore{Secrets: secretUC}
+	openaiClient = llm.WithAnthropicOAuth(openaiClient, anthropicOAuthStore)
 
 	// Multi-provider router (ChatInput model selector). The OpenAI
 	// sub-client uses the resolver-aware path so admin edits keep taking
@@ -2672,6 +2679,9 @@ func main() {
 				knowledgeHandler.Register(protected)
 			}
 			settingHandler.Register(protected)
+			// Anthropic 订阅登录。挂在同一组鉴权中间件后面，
+			// start/complete 只允许 admin（见 handler 里的 requireAdmin）。
+			settingHandler.RegisterAnthropicOAuth(protected, anthropicOAuthStore)
 			integrationHandler.Register(protected)
 			marketplaceHandler.Register(protected)
 			secretHandler.Register(protected)
