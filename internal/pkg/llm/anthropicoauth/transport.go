@@ -3,6 +3,7 @@ package anthropicoauth
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -61,7 +62,11 @@ func (t *Transport) base() http.RoundTripper {
 }
 
 // token returns a usable access token, refreshing when needed.
-func (t *Transport) token(ctx context.Context) (string, error) {
+//
+// force skips the freshness check. Used after a 401: the token looked
+// valid by its expiry but the server rejected it anyway, which happens
+// when it was revoked or rotated out from under us.
+func (t *Transport) token(ctx context.Context, force bool) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -69,7 +74,7 @@ func (t *Transport) token(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("load oauth credential: %w", err)
 	}
-	if cred.Valid(t.now()) {
+	if !force && cred.Valid(t.now()) {
 		return cred.AccessToken, nil
 	}
 	if !cred.Refreshable() {
@@ -97,8 +102,34 @@ func (t *Transport) token(ctx context.Context) (string, error) {
 }
 
 // RoundTrip implements http.RoundTripper.
+//
+// On a 401 it refreshes once and retries. Expiry-based refresh alone is
+// not enough: a token can be rejected while still looking fresh — the
+// usual cause is that another client logged in and rotated it. Without
+// the retry the AI stays broken until the local expiry passes, which
+// can be the better part of an hour, and the only symptom is a 401 that
+// looks like a configuration problem.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	tok, err := t.token(req.Context())
+	resp, err := t.attempt(req, false)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+	// Drain and close so the connection can be reused for the retry.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	_ = resp.Body.Close()
+
+	retried, rerr := t.attempt(req, true)
+	if rerr != nil {
+		// Report the refresh failure, not the original 401 — the
+		// refresh error carries Anthropic's own wording and is what
+		// actually needs fixing.
+		return nil, rerr
+	}
+	return retried, nil
+}
+
+func (t *Transport) attempt(req *http.Request, force bool) (*http.Response, error) {
+	tok, err := t.token(req.Context(), force)
 	if err != nil {
 		return nil, err
 	}
