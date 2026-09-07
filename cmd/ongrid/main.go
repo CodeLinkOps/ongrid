@@ -605,6 +605,11 @@ func main() {
 	// Anthropic 订阅登录（OAuth）。存在凭据时，打 api.anthropic.com 的请求
 	// 改用自动刷新的 bearer；没登录就完全不影响原来的 API key 路径。
 	anthropicOAuthStore := anthropicoauth.SecretStore{Secrets: secretUC}
+	// 进程级注册：MultiClient 会按 settings 动态重建每个 provider 的子客户端
+	// （router.activeSubs），那条路径走的是 llm.New()，拿不到事后挂上的 store。
+	// 只挂在这一个客户端上的话，OAuth 只对启动期那个生效，而真正服务聊天的
+	// 那个悄悄没有 —— 2026-09-07 实测撞到。
+	llm.SetDefaultAnthropicOAuth(anthropicOAuthStore)
 	openaiClient = llm.WithAnthropicOAuth(openaiClient, anthropicOAuthStore)
 
 	// Multi-provider router (ChatInput model selector). The OpenAI
@@ -835,7 +840,17 @@ func main() {
 			Models:  cfg.LLM.Xiaomi.Models,
 		},
 	}
-	llmSettingsResolver := managerbizsetting.NewLLMSettingsResolver(settingSvc, llmEnvDefaults, cfg.LLM.Default)
+	llmSettingsResolver := managerbizsetting.NewLLMSettingsResolver(settingSvc, llmEnvDefaults, cfg.LLM.Default).
+		// 订阅登录（OAuth）也算「已配置」。不加这个钩子，解析器会因为
+		// anthropic_api_key 为空把它整个跳过，调用报
+		// `llm: provider "anthropic" not configured` —— 那句话从不提
+		// API key，运维会去翻刚刚成功的登录。
+		WithAltConfigured(func(ctx context.Context, providerID string) bool {
+			if providerID != llm.ProviderAnthropic {
+				return false
+			}
+			return anthropicOAuthConfigured(ctx, anthropicOAuthStore)
+		})
 	llmRouter.SetProvidersResolver(llmSettingsResolver)
 
 	// All downstream agent/investigator wiring takes the router so a

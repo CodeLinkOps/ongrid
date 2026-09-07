@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -217,7 +218,36 @@ func NewWithResolver(cfg Config, resolver Resolver, budget BudgetChecker, reg *p
 		metrics:    newMetrics(reg, log),
 		log:        log,
 		resolveTTL: 60 * time.Second,
+		oauth:      loadDefaultAnthropicOAuth(),
 	}
+}
+
+// defaultAnthropicOAuth is the process-wide subscription store.
+//
+// Needed because MultiClient rebuilds its per-provider sub-clients from
+// the settings resolver at runtime (see router.activeSubs) — those go
+// through New() and never see a store attached after construction.
+// Without a process-wide default, OAuth worked only for the boot-time
+// client and silently did nothing for the one that actually serves
+// chat. Hit on 2026-09-07.
+//
+// Set once at boot, read-only afterwards; same pattern as
+// internal/pkg/prom.
+var defaultAnthropicOAuth atomic.Value // anthropicoauth.Store
+
+// SetDefaultAnthropicOAuth registers the store every subsequently-built
+// client picks up. Call once at boot, before serving traffic.
+func SetDefaultAnthropicOAuth(store anthropicoauth.Store) {
+	if store != nil {
+		defaultAnthropicOAuth.Store(store)
+	}
+}
+
+func loadDefaultAnthropicOAuth() anthropicoauth.Store {
+	if v, ok := defaultAnthropicOAuth.Load().(anthropicoauth.Store); ok {
+		return v
+	}
+	return nil
 }
 
 // WithAnthropicOAuth attaches a subscription-credential store to a client

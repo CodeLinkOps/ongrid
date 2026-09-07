@@ -30,6 +30,20 @@ type LLMSettingsResolver struct {
 	// from ONGRID_LLM_DEFAULT_PROVIDER). Used when the DB has no
 	// default_provider row.
 	envDefaultProvider string
+
+	// altConfigured lets a provider count as configured without an API
+	// key — today that means an Anthropic subscription login. Optional;
+	// nil keeps the historical key-only behaviour.
+	altConfigured func(ctx context.Context, providerID string) bool
+}
+
+// WithAltConfigured registers the non-API-key configuration probe.
+// Returns the receiver so it can be chained onto a constructor call.
+func (r *LLMSettingsResolver) WithAltConfigured(fn func(ctx context.Context, providerID string) bool) *LLMSettingsResolver {
+	if r != nil {
+		r.altConfigured = fn
+	}
+	return r
 }
 
 // EnvProviderDefaults is the env-seeded fallback for one provider. The
@@ -156,8 +170,23 @@ func (r *LLMSettingsResolver) ResolveProviders(ctx context.Context) ([]llm.Provi
 			apiKey = def.APIKey
 		}
 		if strings.TrimSpace(apiKey) == "" {
-			// Skip — provider not configured anywhere.
-			continue
+			// A provider can also be configured by subscription login
+			// (OAuth) rather than an API key. Without this hook the
+			// resolver drops it and every call fails with
+			//
+			//   llm: provider "anthropic" not configured
+			//
+			// — a message that never mentions the API key, so the
+			// operator goes looking at the login they just completed
+			// successfully. Hit on 2026-09-07 with a probe credential.
+			if r.altConfigured == nil || !r.altConfigured(ctx, pk.id) {
+				continue
+			}
+			// Placeholder: the OAuth transport overwrites Authorization
+			// on every request, so the SDK's static key is irrelevant —
+			// same as the Zhipu JWT path. It only has to be non-empty
+			// to get past the checks that use it as a "configured" flag.
+			apiKey = "oauth"
 		}
 		baseURL, _, _ := r.svc.Get(ctx, model.CategoryLLM, pk.baseURL)
 		if strings.TrimSpace(baseURL) == "" {
