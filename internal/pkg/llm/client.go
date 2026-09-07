@@ -396,7 +396,7 @@ func (c *openaiClient) sdkFor(apiKey, baseURL string) *openai.Client {
 	//
 	// Gated on the store being wired AND a credential existing, so an
 	// install that uses a plain API key is completely unaffected.
-	if c.oauth != nil && looksLikeAnthropicURL(baseURL) {
+	if c.oauth != nil && (apiKey == OAuthPlaceholderKey || looksLikeAnthropicURL(baseURL)) {
 		if cred, err := c.oauth.Load(context.Background()); err == nil && (cred.AccessToken != "" || cred.Refreshable()) {
 			sdkCfg.HTTPClient = &http.Client{
 				Timeout:   90 * time.Second,
@@ -443,6 +443,19 @@ func normalizeOpenAIBaseURL(raw string) string {
 	}
 	return s
 }
+
+// OAuthPlaceholderKey is the api_key value written when a provider is
+// configured by subscription login instead of a key.
+//
+// It doubles as the marker that says "use the OAuth transport for this
+// client". Matching on the base URL alone is not enough: Anthropic does
+// not serve every region (Hong Kong gets a 403 that never mentions
+// geography — see the ops runbook), so an operator may legitimately
+// point the provider at a forwarding proxy. With a URL-only check the
+// transport silently detaches there and the placeholder goes out as the
+// bearer, yielding `401 Invalid Anthropic API Key` — an error that
+// blames the credential when the credential is fine.
+const OAuthPlaceholderKey = "oauth"
 
 // looksLikeAnthropicURL reports whether baseURL points at Anthropic.
 // Deliberately host-based rather than an exact match so a proxy in front

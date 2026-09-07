@@ -186,7 +186,7 @@ func (r *LLMSettingsResolver) ResolveProviders(ctx context.Context) ([]llm.Provi
 			// on every request, so the SDK's static key is irrelevant —
 			// same as the Zhipu JWT path. It only has to be non-empty
 			// to get past the checks that use it as a "configured" flag.
-			apiKey = "oauth"
+			apiKey = "oauth" // llm.OAuthPlaceholderKey（此包不便反向依赖 llm）
 		}
 		baseURL, _, _ := r.svc.Get(ctx, model.CategoryLLM, pk.baseURL)
 		if strings.TrimSpace(baseURL) == "" {
