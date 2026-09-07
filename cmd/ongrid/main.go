@@ -624,10 +624,19 @@ func main() {
 			Models:  dedupeModels(firstNonEmpty(cfg.OpenAI.Model, "gpt-5.4"), "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
 		})
 	}
-	if cfg.LLM.Anthropic.APIKey != "" {
+	// Anthropic 有两种凭据：API key，或订阅登录（OAuth）。
+	//
+	// **只看 APIKey 会把 OAuth 用户挡在门外** —— 登录成功了，provider 却
+	// 依然不在目录里，报 `llm: provider "anthropic" not configured`。
+	// 那个错误完全不提「因为没有 API key」，运维会去翻登录状态、翻 token，
+	// 而那些全是对的。2026-09-07 用探针凭据实测撞到。
+	//
+	// APIKey 留空交给 OAuth transport 覆盖 Authorization —— 与 Zhipu 那条
+	// 路径同理（SDK 的静态 key 在有 transport 时本来就不起作用）。
+	if cfg.LLM.Anthropic.APIKey != "" || anthropicOAuthConfigured(context.Background(), anthropicOAuthStore) {
 		providerCfgs = append(providerCfgs, llm.ProviderConfig{
 			ID: "anthropic", Label: "Anthropic",
-			APIKey:  cfg.LLM.Anthropic.APIKey,
+			APIKey:  firstNonEmpty(cfg.LLM.Anthropic.APIKey, "oauth"),
 			Model:   firstNonEmpty(cfg.LLM.Anthropic.Model, "claude-sonnet-4-6"),
 			BaseURL: firstNonEmpty(cfg.LLM.Anthropic.BaseURL, "https://api.anthropic.com/v1"),
 			Models:  cfg.LLM.Anthropic.Models,
@@ -3326,6 +3335,22 @@ func (r *llmResolverFunc) Resolve(ctx context.Context) (string, string, string, 
 // falling back to "" if all are empty. Used at the LLM provider wiring
 // site to layer "config → env default → hard-coded default" without
 // nesting ternaries.
+// anthropicOAuthConfigured reports whether a subscription login exists.
+//
+// Deliberately tolerant: a load error means "we could not tell", and the
+// safe answer there is false — registering a provider that cannot
+// authenticate would turn a clear "not configured" into a 401 storm.
+func anthropicOAuthConfigured(ctx context.Context, store anthropicoauth.Store) bool {
+	if store == nil {
+		return false
+	}
+	cred, err := store.Load(ctx)
+	if err != nil {
+		return false
+	}
+	return cred.AccessToken != "" || cred.Refreshable()
+}
+
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
