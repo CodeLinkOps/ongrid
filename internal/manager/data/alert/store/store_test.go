@@ -12,6 +12,7 @@ import (
 
 	biz "github.com/ongridio/ongrid/internal/manager/biz/alert"
 	model "github.com/ongridio/ongrid/internal/manager/model/alert"
+	"github.com/ongridio/ongrid/internal/pkg/config"
 	"github.com/ongridio/ongrid/internal/pkg/errs"
 )
 
@@ -447,3 +448,69 @@ func TestPurgeLegacyLogChannels(t *testing.T) {
 func ptrUint64(v uint64) *uint64 { return &v }
 
 func ptrString(v string) *string { return &v }
+
+// TestSeedChannelsDisablesExistingRowWhenEnvTurnsItOff 防的是一类静默失效：
+//
+// 操作者把 ONGRID_NOTIFY_WEBHOOK_ENABLED 设成 false 并清空 URL 之后，
+// 数据库里那条记录曾经保持 enabled=true 和旧 endpoint —— 于是告警继续
+// 送到一个他以为已经关掉的地址。
+//
+// 这个失效从操作者会检查的每个角度看都是正常的：.env 是对的，容器里的
+// 环境变量是对的，唯一的真相在一张没人想到要看的表里。
+func TestSeedChannelsDisablesExistingRowWhenEnvTurnsItOff(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	// 先按「启用」种一次，模拟之前配好的状态
+	on := config.NotificationConfig{
+		Webhook: config.NotifyWebhookConfig{Name: "webhook", Enabled: true, URL: "http://old.local/hook"},
+	}
+	if err := SeedChannelsFromConfig(ctx, repo, on); err != nil {
+		t.Fatalf("首次 seed: %v", err)
+	}
+	got, err := repo.GetChannelByName(ctx, "webhook")
+	if err != nil {
+		t.Fatalf("读取: %v", err)
+	}
+	if !got.Enabled {
+		t.Fatalf("首次 seed 后应为 enabled")
+	}
+
+	// 现在按「停用且清空 URL」再 seed —— 正是操作者在 .env 里做的事
+	off := config.NotificationConfig{
+		Webhook: config.NotifyWebhookConfig{Name: "webhook", Enabled: false, URL: ""},
+	}
+	if err := SeedChannelsFromConfig(ctx, repo, off); err != nil {
+		t.Fatalf("二次 seed: %v", err)
+	}
+	got, err = repo.GetChannelByName(ctx, "webhook")
+	if err != nil {
+		t.Fatalf("读取: %v", err)
+	}
+	if got.Enabled {
+		t.Fatal("环境变量已设为 false，但数据库里那条仍是 enabled —— " +
+			"告警会继续送到操作者以为已经关掉的地址，且没有任何提示")
+	}
+}
+
+// TestSeedChannelsSkipsUnconfiguredOnFreshInstall 守住原本的意图：
+// 全新安装不该被四个空占位通道污染。
+func TestSeedChannelsSkipsUnconfiguredOnFreshInstall(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	cfg := config.NotificationConfig{
+		Webhook:  config.NotifyWebhookConfig{Name: "webhook", Enabled: false, URL: ""},
+		Slack:    config.NotifyWebhookConfig{Name: "slack", Enabled: false, URL: ""},
+		Feishu:   config.NotifyWebhookConfig{Name: "feishu", Enabled: false, URL: ""},
+		DingTalk: config.NotifyWebhookConfig{Name: "dingtalk", Enabled: false, URL: ""},
+	}
+	if err := SeedChannelsFromConfig(ctx, repo, cfg); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for _, name := range []string{"webhook", "slack", "feishu", "dingtalk"} {
+		if _, err := repo.GetChannelByName(ctx, name); !errors.Is(err, errs.ErrNotFound) {
+			t.Errorf("全新安装不该建出 %q（err=%v）", name, err)
+		}
+	}
+}
