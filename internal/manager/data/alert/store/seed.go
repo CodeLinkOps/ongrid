@@ -3,11 +3,13 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	model "github.com/ongridio/ongrid/internal/manager/model/alert"
 	"github.com/ongridio/ongrid/internal/pkg/config"
+	"github.com/ongridio/ongrid/internal/pkg/errs"
 )
 
 // SeedChannelsFromConfig keeps notification_channels in sync with the env
@@ -43,7 +45,35 @@ func SeedChannelsFromConfig(ctx context.Context, repo *Repo, cfg config.Notifica
 		// the UI when they want them. (Without this, the four type
 		// placeholders showed up disabled+empty and even produced no-op
 		// "notification_sent" timeline noise.)
+		//
+		// **But only skip when there is nothing to update.** Skipping a
+		// name that already has a row means "disable this channel via
+		// env" silently does nothing: the row keeps enabled=true and the
+		// old endpoint, so alerts keep going to an address the operator
+		// believes they turned off.
+		//
+		// That failure is invisible from every angle an operator would
+		// check — .env is right, the container's env is right, and the
+		// only place the truth lives is a DB row nobody thought to look
+		// at. Deliveries just keep flowing to the old endpoint.
 		if !c.Enabled && strings.TrimSpace(c.URL) == "" {
+			existing, err := repo.GetChannelByName(ctx, c.Name)
+			if errors.Is(err, errs.ErrNotFound) {
+				// Nothing to sync — this is the fresh-install path the
+				// skip was written for.
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("look up channel %q: %w", c.Name, err)
+			}
+			if !existing.Enabled {
+				// Already off; leave config_json alone so a UI-managed
+				// endpoint isn't wiped by an empty env var.
+				continue
+			}
+			if err := repo.UpdateChannelEnabled(ctx, existing.ID, false); err != nil {
+				return fmt.Errorf("disable channel %q: %w", c.Name, err)
+			}
 			continue
 		}
 		ch := &model.Channel{
