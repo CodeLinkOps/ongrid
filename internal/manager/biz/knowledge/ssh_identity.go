@@ -263,30 +263,43 @@ func (u *Usecase) GenerateSSHIdentity(ctx context.Context, in GenerateSSHIdentit
 // The match is order-stable: identities are sorted by name in
 // ListSSHIdentities, so two identities both glob-matching `git.acme.*`
 // always resolve to the same one for the same host.
-func (u *Usecase) pickSSHIdentityForHost(ctx context.Context, host string) (*model.SSHIdentity, error) {
+// keys are tried most-specific first: "github.com/owner/repo" before
+// "github.com". That is what lets two per-repo deploy keys coexist on
+// one host — see extractSSHTarget for why that case is unavoidable.
+func (u *Usecase) pickSSHIdentityForHost(ctx context.Context, keys ...string) (*model.SSHIdentity, error) {
 	rows, err := u.repo.ListSSHIdentities(ctx)
 	if err != nil {
 		return nil, err
 	}
-	host = strings.ToLower(strings.TrimSpace(host))
-	if host == "" {
+	var wanted []string
+	for _, k := range keys {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k != "" {
+			wanted = append(wanted, k)
+		}
+	}
+	if len(wanted) == 0 {
 		return nil, nil
 	}
-	// Pass 1 — exact match.
-	for _, r := range rows {
-		for _, pat := range parseHosts(r.HostsJSON) {
-			if strings.EqualFold(pat, host) {
-				return r, nil
+	// Pass 1 — exact match, most specific key first.
+	for _, key := range wanted {
+		for _, r := range rows {
+			for _, pat := range parseHosts(r.HostsJSON) {
+				if strings.EqualFold(pat, key) {
+					return r, nil
+				}
 			}
 		}
 	}
-	// Pass 2 — glob match.
-	for _, r := range rows {
-		for _, pat := range parseHosts(r.HostsJSON) {
-			if strings.ContainsAny(pat, "*?[") {
-				ok, _ := filepath.Match(pat, host)
-				if ok {
-					return r, nil
+	// Pass 2 — glob match, same ordering.
+	for _, key := range wanted {
+		for _, r := range rows {
+			for _, pat := range parseHosts(r.HostsJSON) {
+				if strings.ContainsAny(pat, "*?[") {
+					ok, _ := filepath.Match(pat, key)
+					if ok {
+						return r, nil
+					}
 				}
 			}
 		}
@@ -361,6 +374,46 @@ func extractSSHHost(repoURL string) string {
 		}
 	}
 	return ""
+}
+
+// extractSSHTarget returns "host/owner/repo" for an ssh git URL —
+// the more specific key pickSSHIdentityForHost tries before falling
+// back to the bare host.
+//
+// **Why this exists.** Deploy keys are per-repository on GitHub (and
+// GitLab), so an operator with two private repos on the same host
+// necessarily has two keys. Matching on host alone means the first
+// identity wins for both, and the second repo fails to clone with
+//
+//   ERROR: Repository not found.
+//
+// — an error that reads like the URL is wrong, not like the wrong key
+// was offered. Allowing an identity to be registered against
+// "github.com/CodeLinkOps/infra" makes that case expressible.
+//
+// The trailing ".git" and any leading "/" are trimmed so the value
+// matches what an operator would naturally type.
+func extractSSHTarget(repoURL string) string {
+	host := extractSSHHost(repoURL)
+	if host == "" {
+		return ""
+	}
+	repoURL = strings.TrimSpace(repoURL)
+	var path string
+	if strings.HasPrefix(repoURL, "ssh://") {
+		rest := strings.TrimPrefix(repoURL, "ssh://")
+		if slash := strings.Index(rest, "/"); slash >= 0 {
+			path = rest[slash+1:]
+		}
+	} else if colon := strings.Index(repoURL, ":"); colon >= 0 {
+		path = repoURL[colon+1:]
+	}
+	path = strings.TrimPrefix(strings.TrimSpace(path), "/")
+	path = strings.TrimSuffix(path, ".git")
+	if path == "" {
+		return host
+	}
+	return strings.ToLower(host + "/" + path)
 }
 
 // isSSHURL reports whether repoURL is an ssh-style git URL.

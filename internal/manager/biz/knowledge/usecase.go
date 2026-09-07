@@ -2215,8 +2215,12 @@ func (u *Usecase) buildGitAuthEnv(ctx context.Context, repoURL string) ([]string
 		return nil, noop, nil
 	}
 
+	// 先按 host/owner/repo 精确匹配，再退回裸 host。GitHub 的 deploy key
+	// 是按仓库发的，同一台 host 上两个私有仓库必然是两把 key —— 只按 host
+	// 匹配会让第一把通吃，第二个仓库克隆失败并报 "Repository not found"，
+	// 那个错误读起来像 URL 写错了，而不是「递错了钥匙」。
 	host := extractSSHHost(repoURL)
-	identity, err := u.pickSSHIdentityForHost(ctx, host)
+	identity, err := u.pickSSHIdentityForHost(ctx, extractSSHTarget(repoURL), host)
 	if err != nil {
 		return nil, noop, fmt.Errorf("ssh identity lookup: %w", err)
 	}
