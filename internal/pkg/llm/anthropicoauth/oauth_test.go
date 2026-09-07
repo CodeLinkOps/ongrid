@@ -204,3 +204,77 @@ func withTokenURL(t *testing.T, u string) {
 	tokenURL = u
 	t.Cleanup(func() { tokenURL = old })
 }
+
+// TestErrorTextHandlesBothShapes 覆盖线上探到的一个不一致：
+// token 端点在不同失败下用两种 error 形状。
+//
+// refresh token 不对时是字符串：      {"error":"invalid_grant", ...}
+// authorization code 不对时是对象：   {"error":{"type":"...","message":"..."}}
+//
+// 把它写成 string 的话，对象那种会在**解码阶段**就失败，运维看到的是
+//
+//   decode token response (status 403): json: cannot unmarshal object
+//   into Go struct field tokenResp.error of type string
+//
+// —— 这句话对「code 贴错了」这个真实原因只字未提。
+func TestErrorTextHandlesBothShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "字符串形状（刷新失败）",
+			raw:  `{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}`,
+			want: "invalid_grant: Refresh token not found or invalid",
+		},
+		{
+			name: "对象形状（code 无效）",
+			raw:  `{"error":{"type":"invalid_request_error","message":"Invalid authorization code"}}`,
+			want: "invalid_request_error: Invalid authorization code",
+		},
+		{
+			name: "没有 error 字段",
+			raw:  `{"access_token":"x","expires_in":3600}`,
+			want: "",
+		},
+		{
+			name: "error 为 null",
+			raw:  `{"error":null,"access_token":"x"}`,
+			want: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var tr tokenResp
+			if err := json.Unmarshal([]byte(c.raw), &tr); err != nil {
+				t.Fatalf("解码失败（这本身就是那个 bug）: %v", err)
+			}
+			if got := tr.errorText(); got != c.want {
+				t.Errorf("errorText() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestPostSurfacesObjectShapedError 端到端确认：对象形状的错误要变成一句
+// 人能看懂的话，而不是解码失败。
+func TestPostSurfacesObjectShapedError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"Invalid authorization code"}}`))
+	}))
+	defer srv.Close()
+	withTokenURL(t, srv.URL)
+
+	_, err := Exchange(context.Background(), srv.Client(), "bad-code", "verifier")
+	if err == nil {
+		t.Fatal("期望报错")
+	}
+	if !strings.Contains(err.Error(), "Invalid authorization code") {
+		t.Fatalf("错误信息没带上真实原因: %v", err)
+	}
+	if strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Fatalf("仍然是解码失败 —— 那句话对真实原因只字未提: %v", err)
+	}
+}

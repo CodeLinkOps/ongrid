@@ -164,8 +164,47 @@ type tokenResp struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int    `json:"expires_in"`
-	Error        string `json:"error"`
-	ErrorDesc    string `json:"error_description"`
+	// Error is json.RawMessage because the endpoint is not consistent:
+	// a bad refresh token yields `"error":"invalid_grant"` (string),
+	// while a rejected authorization code yields
+	// `"error":{"type":"...","message":"..."}` (object).
+	//
+	// Typing it as string made the object case fail at the decoder and
+	// the operator saw
+	//
+	//   decode token response (status 403): json: cannot unmarshal
+	//   object into Go struct field tokenResp.error of type string
+	//
+	// which says nothing about the actual problem (the code was wrong).
+	// Found by probing the live endpoint with a deliberately invalid
+	// code on 2026-09-07 — before a human ever hit it.
+	Error     json.RawMessage `json:"error"`
+	ErrorDesc string          `json:"error_description"`
+}
+
+// errorText renders whichever shape the endpoint used into one line.
+func (t tokenResp) errorText() string {
+	if len(t.Error) == 0 || string(t.Error) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(t.Error, &s); err == nil {
+		if t.ErrorDesc != "" {
+			return s + ": " + t.ErrorDesc
+		}
+		return s
+	}
+	var obj struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(t.Error, &obj); err == nil && (obj.Type != "" || obj.Message != "") {
+		if obj.Message != "" {
+			return obj.Type + ": " + obj.Message
+		}
+		return obj.Type
+	}
+	return string(t.Error)
 }
 
 func post(ctx context.Context, hc *http.Client, body map[string]string) (Credential, error) {
@@ -191,12 +230,12 @@ func post(ctx context.Context, hc *http.Client, body map[string]string) (Credent
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
 		return Credential{}, fmt.Errorf("decode token response (status %d): %w", resp.StatusCode, err)
 	}
-	if tr.Error != "" {
+	if msg := tr.errorText(); msg != "" {
 		// Surface Anthropic's own wording — "invalid_grant: Refresh
 		// token not found or invalid" tells an operator far more than
 		// a generic failure, and it is the exact string they will see
 		// if a second client rotated the token out from under this one.
-		return Credential{}, fmt.Errorf("oauth: %s: %s", tr.Error, tr.ErrorDesc)
+		return Credential{}, fmt.Errorf("oauth: %s", msg)
 	}
 	if resp.StatusCode != http.StatusOK || tr.AccessToken == "" {
 		return Credential{}, fmt.Errorf("oauth: unexpected response (status %d)", resp.StatusCode)
