@@ -81,24 +81,42 @@ func formatSlack(msg Message) map[string]any {
 			"short": short,
 		})
 	}
-	addField("Severity", sevUpper, true)
-	addField("Source", msg.Source, true)
+	addField(label("severity"), sevUpper, true)
+	addField(label("source"), msg.Source, true)
 	if msg.Labels != nil {
 		// Surface the alert-pipeline labels operators care about as
 		// short fields; the remaining labels stay out of the message
 		// to keep the card readable. Rule/incident/device are the same
 		// breakdown the incident detail page leads with.
-		addField("Rule", msg.Labels["rule"], true)
+		//
+		// **Prefer the human rule name over rule_key.** The key is an
+		// identifier (`restore_drill_failed`); the name is what an
+		// operator wrote for other operators ("恢复演练失败"). Falling
+		// back to the key keeps rules that never got a name readable.
+		ruleLabel := msg.Labels["rule_name"]
+		if ruleLabel == "" {
+			ruleLabel = msg.Labels["rule"]
+		}
+		addField(label("rule"), ruleLabel, true)
 		if id := msg.Labels["incident_id"]; id != "" {
-			addField("Incident", "#"+id, true)
+			addField(label("incident"), "#"+id, true)
 		}
-		if did := msg.Labels["device_id"]; did != "" {
-			addField("Device", "#"+did, true)
+		// Device: prefer the resolved hostname over the numeric id.
+		// "#3" tells nobody which box is on fire.
+		device := msg.Labels["device_hostname"]
+		if device == "" {
+			device = msg.Labels["device_ip"]
 		}
+		if device == "" {
+			if did := msg.Labels["device_id"]; did != "" {
+				device = "#" + did
+			}
+		}
+		addField(label("device"), device, true)
 	}
 	// Dedupe key is the join key for ops chatter — keep full width so
 	// long pipeline:rule:label-set strings stay readable.
-	addField("Dedupe key", msg.DedupeKey, false)
+	addField(label("dedupe_key"), msg.DedupeKey, false)
 	if len(fields) > 0 {
 		att["fields"] = fields
 	}

@@ -210,3 +210,103 @@ func TestSlackSenderColorByUnknownSeverity(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatSlackLocalizedLabelsAndRuleName(t *testing.T) {
+	t.Cleanup(func() { SetDefaultLocale("en") })
+
+	msg := Message{
+		Subject:   "restore_drill_failed: codelinkops_restore_drill_ok == 0",
+		Severity:  SeverityCritical,
+		Source:    "host",
+		DedupeKey: "pipeline:restore_drill_failed:device_id=3",
+		Labels: map[string]string{
+			"rule":            "restore_drill_failed",
+			"rule_name":       "恢复演练失败",
+			"incident_id":     "30",
+			"device_id":       "3",
+			"device_hostname": "ip-10-0-10-15",
+		},
+	}
+
+	SetDefaultLocale("zh-CN")
+	fields := slackFields(t, formatSlack(msg))
+
+	// 字段名走本地化表
+	for key, want := range map[string]string{
+		"级别": "CRITICAL", "来源": "host", "事件": "#30",
+	} {
+		if got, ok := fields[key]; !ok || got != want {
+			t.Errorf("字段 %q = %q (存在=%v)，期望 %q", key, got, ok, want)
+		}
+	}
+
+	// 规则字段优先显示人类可读名，而不是 rule_key
+	if got := fields["规则"]; got != "恢复演练失败" {
+		t.Errorf("规则字段 = %q，期望人类可读名而不是 rule_key", got)
+	}
+	// 设备字段优先主机名 —— "#3" 说明不了哪台机器着火了
+	if got := fields["设备"]; got != "ip-10-0-10-15" {
+		t.Errorf("设备字段 = %q，期望主机名", got)
+	}
+
+	// 回退到英文时字段名恢复，内容不变
+	SetDefaultLocale("en")
+	en := slackFields(t, formatSlack(msg))
+	if got := en["Severity"]; got != "CRITICAL" {
+		t.Errorf("en Severity = %q", got)
+	}
+	if got := en["Rule"]; got != "恢复演练失败" {
+		t.Errorf("en Rule = %q — 规则名是用户写的内容，不该随 locale 变", got)
+	}
+	if _, ok := en["级别"]; ok {
+		t.Error("英文 locale 下不该出现中文字段名")
+	}
+}
+
+// TestFormatSlackFallsBackToRuleKey 覆盖没起名字的规则：卡片仍然可读，
+// 而不是留一个空的规则字段。
+func TestFormatSlackFallsBackToRuleKey(t *testing.T) {
+	t.Cleanup(func() { SetDefaultLocale("en") })
+	SetDefaultLocale("zh-CN")
+	fields := slackFields(t, formatSlack(Message{
+		Severity: SeverityWarning,
+		Labels:   map[string]string{"rule": "swap_high", "device_id": "7"},
+	}))
+	if got := fields["规则"]; got != "swap_high" {
+		t.Errorf("规则字段 = %q，无名规则应回退到 rule_key", got)
+	}
+	if got := fields["设备"]; got != "#7" {
+		t.Errorf("设备字段 = %q，无主机名时应回退到 #id", got)
+	}
+}
+
+// TestUnknownLocaleFallsBackToEnglish：缺翻译时宁可显示英文，
+// 也不要显示空字段名（那会让卡片看起来像坏了）。
+func TestUnknownLocaleFallsBackToEnglish(t *testing.T) {
+	t.Cleanup(func() { SetDefaultLocale("en") })
+	SetDefaultLocale("de-DE")
+	if got := label("dedupe_key"); got != "Dedupe key" {
+		t.Errorf("未知 locale 下 label = %q，期望回退英文", got)
+	}
+}
+
+// slackFields 把 formatSlack 的输出摊平成 title -> value，方便断言。
+func slackFields(t *testing.T, payload map[string]any) map[string]string {
+	t.Helper()
+	atts, ok := payload["attachments"].([]any)
+	if !ok || len(atts) == 0 {
+		t.Fatalf("payload 里没有 attachments: %#v", payload)
+	}
+	att, ok := atts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("attachment 类型不对: %#v", atts[0])
+	}
+	out := map[string]string{}
+	raw, _ := att["fields"].([]map[string]any)
+	for _, f := range raw {
+		title, _ := f["title"].(string)
+		value, _ := f["value"].(string)
+		out[title] = value
+	}
+	return out
+}

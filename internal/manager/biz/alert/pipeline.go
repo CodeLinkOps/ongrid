@@ -452,6 +452,12 @@ func (e *PipelineEvaluator) evaluatePromQuery(ctx context.Context, now time.Time
 	}
 }
 
+// notify builds and dispatches the outbound message for one firing.
+//
+// The card leads with Incident.RuleName (what an operator wrote for the
+// next operator) and keeps Incident.Rule — the key — as the machine-side
+// identifier. Both go out as labels so a formatter can pick; see
+// notify.formatSlack, which prefers rule_name and falls back to rule.
 func (e *PipelineEvaluator) notify(ctx context.Context, res *FiringResult, summary, source string, at time.Time) {
 	if res == nil || res.Incident == nil {
 		return
@@ -466,6 +472,9 @@ func (e *PipelineEvaluator) notify(ctx context.Context, res *FiringResult, summa
 			"rule":        res.Incident.Rule,
 			"incident_id": fmt.Sprintf("%d", res.Incident.ID),
 		},
+	}
+	if name := strings.TrimSpace(res.Incident.RuleName); name != "" && name != res.Incident.Rule {
+		msg.Labels["rule_name"] = name
 	}
 	if res.Incident.DeviceID != nil {
 		deviceID := *res.Incident.DeviceID
