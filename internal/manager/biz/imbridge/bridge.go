@@ -93,6 +93,16 @@ type InboundMessage struct {
 	Text          string // normalized message body — text/plain
 	EventID       string // platform event id, used for dedup
 	ReceiveIDType string // platform-specific hint: "chat_id" / "open_id" / "union_id"
+
+	// ThreadParentText is the message this thread hangs off, when the
+	// provider could fetch it. Used **only when the thread's session is
+	// created** — a reply thread starts an empty session, so without it
+	// the bot answers "这是啥情况" about an alert it cannot see.
+	//
+	// Deliberately not re-sent on later messages in the same thread:
+	// the session already carries the context, and repeating it every
+	// turn would burn tokens and drown the actual question.
+	ThreadParentText string
 }
 
 // HandleInbound resolves the IM thread → ongrid session and kicks off
@@ -155,6 +165,9 @@ func (b *Bridge) HandleInbound(ctx context.Context, sender Sender, msg InboundMe
 
 	wantNew := parseSlashCommand(msg.Text) == cmdNew
 	now := time.Now().UTC()
+	// seedContext is prepended to the very first user message of a newly
+	// created thread session. See InboundMessage.ThreadParentText.
+	seedContext := thread == nil && strings.TrimSpace(msg.ThreadParentText) != ""
 
 	switch {
 	case thread == nil:
@@ -225,8 +238,15 @@ func (b *Bridge) HandleInbound(ctx context.Context, sender Sender, msg InboundMe
 		editor.OnEvent(e)
 	}
 	userContent := msg.Text
+	if seedContext {
+		// The operator replied inside a thread whose root message they
+		// can see and the agent cannot. Hand it over once, clearly
+		// marked as context rather than as something the user typed.
+		userContent = "【本线程的起始消息（用户在它下面提问）】\n" +
+			strings.TrimSpace(msg.ThreadParentText) + "\n\n【用户的问题】\n" + userContent
+	}
 	if d := localeDirective(app.DefaultLocale); d != "" {
-		userContent = msg.Text + "\n\n" + d
+		userContent = userContent + "\n\n" + d
 	}
 	if err := b.agent.StreamMessage(ctx, thread.OngridSessionID, userContent, emit); err != nil {
 		_ = editor.OnFatal(err)

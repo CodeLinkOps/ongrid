@@ -247,8 +247,43 @@ func TestStripMentions(t *testing.T) {
 		{"<unclosed", "<unclosed"},
 	}
 	for _, c := range cases {
-		if got := stripMentions(c.in); got != c.want {
+		if got := stripMentions(c.in, ""); got != c.want {
 			t.Errorf("stripMentions(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestStripMentionsDropsBotSelfMention 覆盖生产上真实发生过的一次失败。
+//
+// 在频道里 @ 机器人时，原文是 `<@U0BV8744CSF> 这是啥情况`。旧实现把它改写成
+// `@U0BV8744CSF 这是啥情况`，于是模型盯着一个它解析不了的标识符，回了一段
+// 「U0BV8744CSF 看起来不是我能直接解析的 ID，请告诉我你指的是哪种对象」——
+// 一整轮什么也没做。
+//
+// 机器人自己的 @ 是**寻址**不是内容，必须整个拿掉。
+func TestStripMentionsDropsBotSelfMention(t *testing.T) {
+	const self = "U0BV8744CSF"
+	cases := []struct{ in, want string }{
+		{"<@U0BV8744CSF> 这是啥情况", "这是啥情况"},
+		{"<@U0BV8744CSF|ongrid> 这是啥情况", "这是啥情况"},
+		{"帮我看看 <@U0BV8744CSF> 谢谢", "帮我看看  谢谢"},
+		// 别人的 @ 要保留 —— 那可能是内容的一部分
+		{"<@U0BV8744CSF> 问一下 <@UOTHER123>", "问一下 @UOTHER123"},
+		// 没有自身 @ 时行为不变
+		{"直接问一句", "直接问一句"},
+	}
+	for _, c := range cases {
+		if got := stripMentions(c.in, self); got != c.want {
+			t.Errorf("stripMentions(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestStripMentionsWithoutSelfIDIsUnchanged：auth.test 失败时 selfID 为空，
+// 此时必须退回旧行为而不是崩掉或吃掉别人的 @。
+func TestStripMentionsWithoutSelfIDIsUnchanged(t *testing.T) {
+	const in = "<@U0BV8744CSF> 这是啥情况"
+	if got := stripMentions(in, ""); got != "@U0BV8744CSF 这是啥情况" {
+		t.Errorf("selfID 为空时应保持旧行为，得到 %q", got)
 	}
 }
