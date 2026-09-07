@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -191,6 +192,48 @@ func (c *Client) call(ctx context.Context, method, token string, body any, dst a
 	return nil
 }
 
+// callForm is call() with x-www-form-urlencoded instead of JSON.
+//
+// **Not every Slack Web API method accepts JSON.** The chat.* family
+// does; conversations.replies does not — it answers `invalid_arguments`,
+// an error that says nothing about the encoding and reads like the
+// channel or ts is wrong. Cost me a broken feature that looked deployed:
+// the thread-context fetch failed on every call and only showed up as a
+// warning line nobody was reading (2026-09-07).
+func (c *Client) callForm(ctx context.Context, method, token string, form url.Values, dst any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/"+method,
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("slack %s: %w", method, err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("slack %s: status %s body=%s", method, resp.Status, truncate(raw, 200))
+	}
+	var env apiResp
+	if uerr := json.Unmarshal(raw, &env); uerr != nil {
+		return fmt.Errorf("slack %s: decode envelope: %w (body=%s)", method, uerr, truncate(raw, 200))
+	}
+	if !env.OK {
+		return fmt.Errorf("slack %s: %s", method, env.Error)
+	}
+	if dst != nil {
+		if uerr := json.Unmarshal(raw, dst); uerr != nil {
+			return fmt.Errorf("slack %s: decode result: %w", method, uerr)
+		}
+	}
+	return nil
+}
+
 // PostMessage creates a new text message in channel and returns the
 // platform message id (Slack's `ts` field, a high-precision float as
 // string — DON'T parse it, just round-trip the string verbatim through
@@ -302,13 +345,13 @@ func (c *Client) ThreadParent(ctx context.Context, channel, threadTS string) (st
 			TS   string `json:"ts"`
 		} `json:"messages"`
 	}
-	body := map[string]any{
-		"channel": channel,
-		"ts":      threadTS,
-		"limit":   1,
-		"inclusive": true,
-	}
-	if err := c.call(ctx, "conversations.replies", c.botToken, body, &out); err != nil {
+	// **Form-encoded, not JSON** — see callForm.
+	form := url.Values{}
+	form.Set("channel", channel)
+	form.Set("ts", threadTS)
+	form.Set("limit", "1")
+	form.Set("inclusive", "true")
+	if err := c.callForm(ctx, "conversations.replies", c.botToken, form, &out); err != nil {
 		return "", err
 	}
 	if len(out.Messages) == 0 {
