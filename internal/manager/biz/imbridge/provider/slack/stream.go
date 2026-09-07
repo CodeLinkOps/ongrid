@@ -248,11 +248,29 @@ func (c *StreamClient) handleEvent(payload json.RawMessage) {
 			slog.String("channel", ev.Channel))
 		return
 	}
+	// 会话粒度 = 一条 Slack thread，不是一个频道。
+	//
+	// ev.ThreadTS 在「频道里直接 @ 机器人」时是空的。原先直接用它，键就变成
+	// (app, channel, "") —— **整个频道共用一条会话**，两个人问不相干的事会
+	// 串到一起，而且谁的追问都可能接到别人的问题后面。
+	//
+	// 改成：没有 thread 时用这条消息自身的 ts 当键，同时把回复发进以它为根的
+	// thread（见 senderAdapter.threadTS）。于是每次频道里的提问各自开一条线，
+	// 线里的追问接着同一条会话。
+	//
+	// 这个粒度是 CodeLinkOps/prime-slack-bridge 试错两轮定下来的（见那个仓库
+	// DESIGN.md §3.4）：每 repo 一条会话会让两个任务抢同一条 session；每条
+	// 消息一条会话则「Agent 不记得前面说过的话」，而且**它不报错** ——
+	// 会一本正经地按「你只发过这一句」回答。
+	threadKey := ev.ThreadTS
+	if threadKey == "" {
+		threadKey = ev.TS
+	}
 	in := bizbridge.InboundMessage{
 		Provider:      model.ProviderSlack,
 		AppID:         c.app.AppID,
 		ChatID:        ev.Channel,
-		ThreadID:      ev.ThreadTS,
+		ThreadID:      threadKey,
 		OpenID:        ev.User,
 		UserName:      ev.User, // Slack only ships user_id here; the bridge logs it
 		Text:          stripMentions(ev.Text, c.selfID),
@@ -282,7 +300,7 @@ func (c *StreamClient) handleEvent(payload json.RawMessage) {
 			c.log.Warn("slack: fetch thread root failed", slog.Any("err", err))
 		}
 	}
-	sender := senderAdapter{client: c.client, channel: ev.Channel}
+	sender := senderAdapter{client: c.client, channel: ev.Channel, threadTS: threadKey}
 	// Detach: agent runs take 30s+; the read loop must keep moving
 	// (and must keep acking — Slack reuses one socket for all events).
 	go func() {
@@ -366,6 +384,9 @@ func stripOtherMentions(s string) string {
 type senderAdapter struct {
 	client  *Client
 	channel string
+	// threadTS makes every reply land in the thread this conversation
+	// belongs to. Empty only for providers/paths without threads.
+	threadTS string
 }
 
 func (s senderAdapter) SendText(ctx context.Context, receiveID, _ string, text string) (string, error) {
@@ -373,7 +394,7 @@ func (s senderAdapter) SendText(ctx context.Context, receiveID, _ string, text s
 	if channel == "" {
 		channel = s.channel
 	}
-	return s.client.PostMessage(ctx, channel, text)
+	return s.client.PostMessageInThread(ctx, channel, s.threadTS, text)
 }
 
 func (s senderAdapter) EditText(ctx context.Context, messageID, text string) error {
