@@ -641,7 +641,7 @@ func main() {
 	if cfg.LLM.Anthropic.APIKey != "" || anthropicOAuthConfigured(context.Background(), anthropicOAuthStore) {
 		providerCfgs = append(providerCfgs, llm.ProviderConfig{
 			ID: "anthropic", Label: "Anthropic",
-			APIKey:  firstNonEmpty(cfg.LLM.Anthropic.APIKey, "oauth"),
+			APIKey:  firstNonEmpty(cfg.LLM.Anthropic.APIKey, llm.OAuthPlaceholderKey),
 			Model:   firstNonEmpty(cfg.LLM.Anthropic.Model, "claude-sonnet-4-6"),
 			BaseURL: firstNonEmpty(cfg.LLM.Anthropic.BaseURL, "https://api.anthropic.com/v1"),
 			Models:  cfg.LLM.Anthropic.Models,
